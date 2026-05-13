@@ -29,8 +29,11 @@ This script validates:
   - Critical files (robots.txt, llms.txt, llms-full.txt)
   - JSON-LD structured data validation
   - Image-asset redirect audit (nginx-config-driven)
-  - Generic redirect-set verification (every exact-match nginx redirect)
-  - Orphan image audit (assets in dist/ never referenced from rendered HTML)
+  - Generic redirect-set verification (every exact-match nginx redirect,
+    with duplicate-source detection)
+  - Orphan image audit (assets in dist/images/ and dist/og/ never
+    referenced from rendered HTML)
+  - OG image resolution check (every og:image URL returns HTTP 200)
 
 Exit codes:
   0 - All checks passed
@@ -62,11 +65,37 @@ License:    MIT License
 
 Website:    https://speytech.com
 
-Version:    7.3.0
+Version:    7.4.0
 Created:    2026-01-25
 Modified:   2026-05-13
 
 Changelog:
+  v7.4.0 (2026-05-13) - Hardening release. Three additions that close edge
+                        cases v7.3.0 leaves behind.
+                      - Section 5 (Open Graph) now verifies every og:image
+                        URL returns HTTP 200 via HEAD request. Catches
+                        articles referencing OG images that no longer
+                        exist on disk (cache write failed, article renamed
+                        without regenerating OG, etc.). Hard failure for
+                        any declared og:image that does not resolve.
+                      - Section 21 (Redirect Set) now detects duplicate
+                        source paths in the nginx config. If two
+                        location = X blocks declare the same source,
+                        nginx silently picks one. The audit flags every
+                        occurrence as a hard failure with the count of
+                        duplicate blocks.
+                      - Section 22 (Orphan Image) now walks dist/og/ as
+                        well as dist/images/. Per-directory subtotals in
+                        the output. The dist/og/ tree is structured by
+                        section subdirectory (insights, ai-architecture,
+                        open-source); the walk is recursive.
+                      - New CLI flag: --image-dirs DIR[,DIR...] to
+                        override the default ["images", "og"] scan set.
+                      - Section 21's "expected 200" tolerance now accepts
+                        any 2xx final status for non-410 redirects. The
+                        speytech.com config produced 200s exclusively in
+                        practice, but the strict ==200 check was
+                        unnecessarily narrow.
   v7.3.0 (2026-05-13) - Added three audit sections for asset-redirect coverage
                       - Section 20: Image-Asset Redirect Audit. Verifies every
                         nginx `location =` image redirect resolves cleanly
@@ -137,9 +166,9 @@ import sys
 import re
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
-from collections import defaultdict
+from collections import defaultdict, Counter
 
-__version__ = "7.3.0"
+__version__ = "7.4.0"
 
 # =============================================================================
 # ANSI Colours
@@ -228,8 +257,9 @@ KNOWN_REDIRECTS = [
 IMAGE_EXTENSIONS = {".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico"}
 
 # Directories under dist/ that hold image assets. Walked by the orphan audit.
-# Kept narrow so the audit does not flag, e.g., favicon variants in dist root.
-IMAGE_DIRS = ["images"]
+# v7.4: includes 'og' so dynamically generated OG PNGs are also audited.
+# Override via --image-dirs.
+IMAGE_DIRS = ["images", "og"]
 
 
 def parse_nginx_redirects(config_path):
@@ -281,6 +311,19 @@ def is_image_path(path):
         return False
     lower = path.lower().split("?", 1)[0].split("#", 1)[0]
     return any(lower.endswith(ext) for ext in IMAGE_EXTENSIONS)
+
+
+def head_check(url, timeout=10):
+    """
+    Issue an HTTP HEAD against a URL and return (status_code, error).
+    On any error, status_code is None and error is a short string.
+    Used by section 5 to verify og:image URLs resolve.
+    """
+    try:
+        r = requests.head(url, timeout=timeout, allow_redirects=True)
+        return r.status_code, None
+    except requests.exceptions.RequestException as e:
+        return None, str(e).split('\n', 1)[0][:80]
 
 
 def mark_failure():
@@ -707,21 +750,31 @@ def audit_meta_robots():
         print(f"\nMeta robots summary: {RED}{issues_found} pages blocked from indexing{RESET}")
 
 
-def audit_open_graph():
-    """Check Open Graph tags for social sharing."""
+def audit_open_graph(domain, timeout=10, workers=10):
+    """
+    Check Open Graph tags for social sharing, and verify og:image URLs
+    resolve to HTTP 200.
+
+    v7.4 extension: every unique og:image URL gets a HEAD request. Non-2xx
+    is a hard failure — declared og:image that does not exist is a real
+    SEO bug (social previews break, link unfurls fall back to fallback
+    image, structured data validation fails).
+    """
     print_header("5. Open Graph Tags Audit")
-    
+
     missing_og = []
     partial_og = []
-    
+    og_image_refs = defaultdict(list)  # og_image_url -> [pages referencing it]
+
     for url, data in PAGE_DATA.items():
         if data['status_code'] != 200:
             continue
-        
+
         has_title = bool(data.get('og_title'))
         has_desc = bool(data.get('og_description'))
-        has_image = bool(data.get('og_image'))
-        
+        og_image = data.get('og_image')
+        has_image = bool(og_image)
+
         if not has_title and not has_desc and not has_image:
             missing_og.append(url)
         elif not (has_title and has_desc and has_image):
@@ -733,26 +786,76 @@ def audit_open_graph():
             if not has_image:
                 missing.append('og:image')
             partial_og.append((url, missing))
-    
+
+        # Collect unique og:image URLs for HEAD verification.
+        if og_image:
+            absolute = urljoin(url, og_image)
+            og_image_refs[absolute].append(url)
+
+    # --- Tag presence checks (existing v7.2.1 behaviour) ---
     if missing_og:
         print_subheader(f"Missing all OG tags ({len(missing_og)} pages)")
-        for url in missing_og[:10]:  # Show first 10
+        for url in missing_og[:10]:
             print(f"{YELLOW}⚠{RESET} {urlparse(url).path}")
         if len(missing_og) > 10:
             print(f"   {DIM}... and {len(missing_og) - 10} more{RESET}")
-    
+
     if partial_og:
         print_subheader(f"Partial OG tags ({len(partial_og)} pages)")
         for url, missing in partial_og[:10]:
             print(f"{YELLOW}⚠{RESET} {urlparse(url).path} - missing: {', '.join(missing)}")
         if len(partial_og) > 10:
             print(f"   {DIM}... and {len(partial_og) - 10} more{RESET}")
-    
+
     if not missing_og and not partial_og:
         print(f"{GREEN}✓ All pages have complete Open Graph tags{RESET}")
-    
-    total_issues = len(missing_og) + len(partial_og)
-    print(f"\nOpen Graph summary: {YELLOW if total_issues else GREEN}{total_issues} pages with incomplete OG tags{RESET}")
+
+    total_tag_issues = len(missing_og) + len(partial_og)
+    print(f"\nOpen Graph tag summary: {YELLOW if total_tag_issues else GREEN}{total_tag_issues} pages with incomplete OG tags{RESET}")
+
+    # --- v7.4: og:image resolution check ---
+    if not og_image_refs:
+        return
+
+    print_subheader(f"Verifying {len(og_image_refs)} unique og:image URL(s) resolve...")
+
+    resolution_failures = []
+
+    def _check(url):
+        status, error = head_check(url, timeout=timeout)
+        return url, status, error
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        results = list(executor.map(_check, og_image_refs.keys()))
+
+    for url, status, error in results:
+        path = urlparse(url).path
+        referencing_pages = og_image_refs[url]
+        if error is not None:
+            print(f"{RED}✗{RESET} {path} -> ERROR: {error}")
+            resolution_failures.append((url, status, error, referencing_pages))
+            mark_failure()
+        elif status is None or status < 200 or status >= 300:
+            print(f"{RED}✗{RESET} {path} -> {status}")
+            resolution_failures.append((url, status, error, referencing_pages))
+            mark_failure()
+        # Silent on 200s — too noisy to print every resolved og:image.
+
+    if not resolution_failures:
+        print(f"{GREEN}✓ All og:image URLs resolve cleanly (HTTP 2xx){RESET}")
+    else:
+        # Show which pages reference each broken og:image so the operator
+        # knows where to look.
+        print(f"\n{CYAN}Broken og:image references:{RESET}")
+        for url, status, error, pages in resolution_failures:
+            path = urlparse(url).path
+            print(f"  {path} ({status if status is not None else 'ERROR'})")
+            for page in pages[:3]:
+                print(f"    └─ referenced by {urlparse(page).path}")
+            if len(pages) > 3:
+                print(f"    └─ ... and {len(pages) - 3} more page(s)")
+
+    print(f"\nog:image resolution summary: {RED if resolution_failures else GREEN}{len(resolution_failures)} broken URL(s){RESET}")
 
 
 def audit_viewport():
@@ -1402,7 +1505,7 @@ def _verify_redirect(domain, source, target, expected_status):
             'chain_label': f"{source_status}",
         }
 
-    if final_status != 200:
+    if final_status is None or final_status < 200 or final_status >= 300:
         return {
             'ok': False,
             'severity': 'fail',
@@ -1496,6 +1599,10 @@ def audit_redirect_set(domain, nginx_config_path):
     Section 21: verify every exact-match nginx redirect (image and non-image)
     resolves cleanly. Catches drift across the full redirect set, not just
     images.
+
+    v7.4: also detects duplicate source paths across location = blocks.
+    nginx silently picks one when sources overlap, which is a real
+    config-integrity bug the validator should catch.
     """
     print_header("21. Redirect Set Verification")
 
@@ -1511,9 +1618,15 @@ def audit_redirect_set(domain, nginx_config_path):
     print(f"Discovered {len(redirects)} exact-match redirect rule(s) from {source_label}. Verifying...")
 
     issues = 0
+
+    # v7.4: duplicate-source detection. If two location = blocks declare the
+    # same source, nginx silently picks one (typically the first match in
+    # the parsed config). The audit flags this as a hard failure.
+    source_counts = Counter(src for src, _, _ in redirects)
+    duplicates = {src: count for src, count in source_counts.items() if count > 1}
+
     for source, target, status in redirects:
         result = _verify_redirect(domain, source, target, status)
-        target_label = target if target else "410"
         if result['severity'] == 'ok':
             print(f"{GREEN}✓{RESET} {source} -> {result['chain_label']}")
         elif result['severity'] == 'warn':
@@ -1524,16 +1637,31 @@ def audit_redirect_set(domain, nginx_config_path):
             mark_failure()
             issues += 1
 
+    if duplicates:
+        print(f"\n{RED}Duplicate source paths detected ({len(duplicates)} conflict(s)):{RESET}")
+        for source, count in sorted(duplicates.items()):
+            print(f"{RED}✗{RESET} {source} appears in {count} location blocks")
+            print(f"   {CYAN}└─ nginx will silently pick one. Remove the duplicate block(s).{RESET}")
+            mark_failure()
+            issues += 1
+
     print(f"\nRedirect set summary: {RED if issues else GREEN}{issues} issue{'s' if issues != 1 else ''} found{RESET}")
 
 
-def audit_orphan_images(domain, dist_path, nginx_config_path, strict=False):
+def audit_orphan_images(domain, dist_path, nginx_config_path, image_dirs=None, strict=False):
     """
-    Section 22: walk dist/images/ and flag any asset never referenced from
-    rendered HTML or from a redirect target. INFO by default; --strict
-    escalates to failure.
+    Section 22: walk each directory in image_dirs and flag any asset never
+    referenced from rendered HTML or from a redirect target. INFO by
+    default; --strict escalates to failure.
+
+    v7.4: image_dirs is configurable (default IMAGE_DIRS = ["images", "og"]).
+    Per-directory subtotals are printed when more than one directory is
+    walked.
     """
     print_header("22. Orphan Image Audit")
+
+    if image_dirs is None:
+        image_dirs = IMAGE_DIRS
 
     dist = Path(dist_path)
     if not dist.is_dir():
@@ -1542,22 +1670,31 @@ def audit_orphan_images(domain, dist_path, nginx_config_path, strict=False):
         print(f"\nOrphan image summary: {GREEN}0 issues found{RESET}")
         return
 
-    # Walk dist/images/ (and any additional dirs in IMAGE_DIRS) for assets.
+    # Walk each image directory. Track per-directory counts for the summary.
     on_disk = set()
-    for subdir in IMAGE_DIRS:
+    per_dir_counts = {}  # subdir -> count of assets discovered
+    for subdir in image_dirs:
         scan_root = dist / subdir
         if not scan_root.is_dir():
+            per_dir_counts[subdir] = None  # signal "missing"
             continue
+        dir_assets = set()
         for path in scan_root.rglob("*"):
             if not path.is_file():
                 continue
             if path.suffix.lower() in IMAGE_EXTENSIONS:
-                # Store as the URL path the asset would serve under
                 rel = path.relative_to(dist).as_posix()
-                on_disk.add("/" + rel)
+                dir_assets.add("/" + rel)
+        on_disk.update(dir_assets)
+        per_dir_counts[subdir] = len(dir_assets)
 
     if not on_disk:
-        print(f"{YELLOW}No image assets found under {dist_path}/{{{','.join(IMAGE_DIRS)}}}.{RESET}")
+        present_dirs = [d for d, c in per_dir_counts.items() if c is not None]
+        missing_dirs = [d for d, c in per_dir_counts.items() if c is None]
+        if missing_dirs and not present_dirs:
+            print(f"{YELLOW}⚠ None of the configured image directories exist under {dist_path}: {', '.join(missing_dirs)}.{RESET}")
+        else:
+            print(f"{YELLOW}No image assets found under {dist_path}/{{{','.join(image_dirs)}}}.{RESET}")
         print(f"\nOrphan image summary: {GREEN}0 issues found{RESET}")
         return
 
@@ -1590,8 +1727,14 @@ def audit_orphan_images(domain, dist_path, nginx_config_path, strict=False):
             referenced.add(target)
 
     orphans = sorted(on_disk - referenced)
+    referenced_count = len(on_disk - set(orphans))
 
-    print(f"{len(on_disk)} image asset(s) in {dist_path}, {len(on_disk - set(orphans))} referenced from rendered HTML or redirect targets.")
+    # Per-directory subtotals when more than one dir walked
+    present_dirs = [(d, c) for d, c in per_dir_counts.items() if c is not None]
+    if len(present_dirs) > 1:
+        subtotal_str = ", ".join(f"{dist_path}/{d}/ ({c} assets)" for d, c in present_dirs)
+        print(f"Walked {subtotal_str}.")
+    print(f"{len(on_disk)} image asset(s) total, {referenced_count} referenced from rendered HTML, og:image tags, favicon links, or redirect targets.")
 
     if not orphans:
         print(f"\nOrphan image summary: {GREEN}0 issues found{RESET}")
@@ -1759,6 +1902,12 @@ Exit codes:
         help="Path to the built static site root for the orphan image audit (default: ./dist)"
     )
     parser.add_argument(
+        "--image-dirs",
+        type=str,
+        default=None,
+        help="Comma-separated list of subdirectories under dist-path to scan for orphans (default: " + ",".join(IMAGE_DIRS) + ")"
+    )
+    parser.add_argument(
         "-v", "--version",
         action="version",
         version=f"%(prog)s {__version__}"
@@ -1812,7 +1961,7 @@ if __name__ == "__main__":
     audit_meta_robots()
     
     if not args.skip_og:
-        audit_open_graph()
+        audit_open_graph(domain, timeout=args.timeout, workers=args.workers)
     
     audit_viewport()
     audit_favicon(domain)
@@ -1847,7 +1996,10 @@ if __name__ == "__main__":
         audit_redirect_set(domain, args.nginx_config)
     
     if not args.skip_orphan_images:
-        audit_orphan_images(domain, args.dist_path, args.nginx_config, strict=args.strict)
+        image_dirs = None
+        if args.image_dirs:
+            image_dirs = [d.strip() for d in args.image_dirs.split(",") if d.strip()]
+        audit_orphan_images(domain, args.dist_path, args.nginx_config, image_dirs=image_dirs, strict=args.strict)
     
     # Final summary
     print("\n" + "=" * 60)

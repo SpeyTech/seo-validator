@@ -81,6 +81,7 @@ is passed.
 | `--skip-orphan-images` | Skip the orphan image audit (section 22). |
 | `--nginx-config PATH` | Path to nginx config for redirect discovery. Default: `/etc/nginx/sites-available/speytech.com`. |
 | `--dist-path PATH` | Path to the built static site root for the orphan image audit. Default: `./dist`. |
+| `--image-dirs DIR[,DIR...]` | Comma-separated subdirectories under `dist-path` to scan for orphans. Default: `images,og`. |
 | `-v, --version` | Print version and exit. |
 | `-h, --help` | Print help and exit. |
 
@@ -90,7 +91,7 @@ is passed.
 2. Basic SEO (status + core elements)
 3. Title and description length
 4. Meta robots (noindex detection)
-5. Open Graph tags
+5. Open Graph tags (presence + og:image URL resolves to HTTP 2xx)
 6. Viewport meta (mobile-friendliness)
 7. Favicon
 8. Heading hierarchy
@@ -106,8 +107,8 @@ is passed.
 18. Critical files (`robots.txt`, `llms.txt`, `llms-full.txt`)
 19. JSON-LD schema validation
 20. Image-asset redirect audit
-21. Redirect set verification
-22. Orphan image audit
+21. Redirect set verification (with duplicate-source detection)
+22. Orphan image audit (walks `dist/images/` and `dist/og/`)
 
 ## Output format
 
@@ -180,6 +181,25 @@ AUDIT FAILED. See errors above.
 
 INFO findings and warnings never affect the exit code unless `--strict`
 is passed, in which case INFO findings escalate to failures.
+
+When wiring into CI, run the validator without piping if you need the
+exit code. A trailing `| tee` or `| grep` will mask the validator's
+exit code with the pipe-tail's. Use `${PIPESTATUS[0]}` in bash if you
+must pipe:
+
+```bash
+# Correct: exit code captured cleanly
+python3 seo_validator.py --domain example.com
+echo $?
+
+# Also correct (bash): exit code via PIPESTATUS
+python3 seo_validator.py --domain example.com 2>&1 | tee /tmp/audit.log
+echo "${PIPESTATUS[0]}"
+
+# Incorrect: $? reports tee's exit code, not the validator's
+python3 seo_validator.py --domain example.com | tee /tmp/audit.log
+echo $?   # always 0 if tee writes successfully
+```
 
 ## Configuration
 

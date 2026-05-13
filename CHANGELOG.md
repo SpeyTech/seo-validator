@@ -1,127 +1,146 @@
-# SEO Validator v7.3.0 — Asset-Redirect Coverage
+# SEO Validator v7.4.0 — Edge-Case Hardening
 
-**Released:** 2026-05-13
+**Released:** 2026-05-13 (same day as v7.3.0)
 
 ## Why this release
 
-A real operational finding on 2026-05-13 surfaced a gap in v7.2.1's coverage.
-Five legacy hero SVGs were renamed to slug-matching canonical names, and
-nginx 301 redirects were added at the canonical apex server block for the
-legacy paths. v7.2.1's trailing-slash audit only sampled HTML URLs, so
-broken image redirects would have passed the audit while real failures
-existed on the live site.
+v7.3.0 added three audit sections (image-asset redirects, generic redirect-set
+verification, orphan image audit) and immediately caught six real bugs on
+first production run. The release cleared the structural gaps v7.2.1 had.
 
-v7.3.0 closes that gap and the broader gap it implies: any exact-match
-`location =` redirect declared in the nginx config could silently break
-between deploys without the validator noticing.
+v7.4.0 closes the edge cases v7.3.0 leaves behind:
 
-## Audit sections added
+- An article can declare an `og:image` URL that doesn't exist on disk. v7.3
+  flags the article as having an OG tag (correct) and flags an orphan
+  asset if there's a different file with no reference (correct). It does
+  not flag the declared-but-missing case. Crawlers see a broken og:image,
+  social previews break, the audit passes.
+- Two `location =` blocks in nginx can declare the same source path.
+  nginx silently picks one — typically the first match in the hash table
+  lookup, but the behaviour is not documented as deterministic across
+  config reloads. v7.3 has no view on this.
+- The OG image set (67 dynamically-generated PNGs under `dist/og/`) was
+  outside the orphan audit's scope. v7.3 only walked `dist/images/`.
+  An article rename without OG regeneration left stale PNGs on disk
+  with no detection.
 
-### Section 20: Image-Asset Redirect Audit
+v7.4.0 closes all three.
 
-Discovers every `location = /images/X.{svg,png,...} { return 301 /images/Y.{svg,png,...}; }`
-rule from the nginx config and verifies each one resolves cleanly:
+## Audit changes
 
-- source returns 301
-- target returns 200
-- chain length is exactly 2
+### Section 5: Open Graph Tags Audit (extended)
 
-Cross-references rendered HTML to flag pages that still reference legacy
-slugs. These are reported as INFO findings (the redirect catches them for
-visitors, but the page source should be updated to the canonical path).
+Existing v7.2.1 behaviour preserved: every page's `og:title`, `og:description`,
+`og:image` presence is checked.
 
-Hard failure for broken or chained redirects.
+New in v7.4: every unique `og:image` URL collected from the audit run gets
+an HTTP HEAD request. Non-2xx is a hard failure. The output lists each
+broken URL plus the pages that reference it (first three, then a count).
 
-### Section 21: Redirect Set Verification
+The HEAD requests run in parallel via the existing `--workers` thread pool,
+so the additional runtime cost is roughly the slowest single HEAD round-trip
+(~50-200ms on a typical site with 60-80 unique og:image URLs).
 
-Same discovery extended to every exact-match `location =` redirect in the
-config, not just image redirects. Covers legacy URL renames
-(`/contact-us/` → `/contact/`), search-engine and crawler conventions
-(`/sitemap.xml` → `/sitemap-index.xml`, RSS/Atom paths → `/rss.xml`),
-410 Gone rules for deliberately-removed URLs, and the image redirects from
-section 20.
+### Section 21: Redirect Set Verification (extended)
 
-Hard failure for any source that no longer redirects, any target that no
-longer returns 200, or any redirect that chains.
+Existing v7.3 behaviour preserved: every exact-match nginx redirect is
+verified source 301 → target 2xx in one hop, or source 410 if the rule is
+a Gone declaration.
 
-The full speytech.com config produces 17 rules: 16 × 301 redirects plus
-1 × 410 Gone (`/home-temp/`).
+New in v7.4: duplicate source-path detection. The parser already preserves
+duplicates (the regex matches every `location = X { return ...; }` block
+independently); v7.4 adds a `Counter` pass over the parsed result and
+flags any source appearing more than once. Each duplicate is reported as
+a hard failure with the count of conflicting blocks.
 
-### Section 22: Orphan Image Audit
+This catches a real config-integrity bug class: two `location =` rules
+with the same source path silently shadow each other. Whichever rule
+wins depends on nginx's internal lookup order, which is not stable across
+config reloads. Removing the duplicate is always the right fix.
 
-Walks `dist/images/` for image assets and flags any that are never
-referenced from rendered HTML pages, `og:image` tags, favicon links, or
-nginx redirect targets. Redirect targets count as references — a 301 to a
-canonical asset is itself a reference that should keep the target on disk.
+### Section 22: Orphan Image Audit (extended)
 
-INFO finding by default; `--strict` escalates to failure.
+`IMAGE_DIRS` default extended from `["images"]` to `["images", "og"]`.
+The orphan walk now covers both directories recursively. The output
+reports per-directory subtotals when more than one directory is walked:
+
+```
+Walked dist/images/ (66 assets), dist/og/ (67 assets).
+133 image asset(s) total, 133 referenced from rendered HTML, og:image
+tags, favicon links, or redirect targets.
+
+Orphan image summary: 0 issues found
+```
+
+The dist/og/ tree is structured by section subdirectory (insights,
+ai-architecture, open-source) on speytech.com. The walk is recursive so
+the nested structure is handled without configuration. Section banner
+PNGs at `dist/og/insights.png` (etc.) are picked up alongside the
+per-article PNGs at `dist/og/insights/<slug>.png`.
 
 ## CLI additions
 
-- `--nginx-config PATH` — path to nginx config for redirect discovery.
-  Defaults to `/etc/nginx/sites-available/speytech.com`. The validator
-  runs on the same host as nginx (post-atomic-swap, against the live
-  site), so this file is normally readable.
-- `--dist-path PATH` — built site root for the orphan image audit.
-  Defaults to `./dist`.
-- `--skip-image-redirects` — skip section 20.
-- `--skip-redirect-set` — skip section 21.
-- `--skip-orphan-images` — skip section 22.
+- `--image-dirs DIR1,DIR2[,...]` — override the default `images,og` scan
+  set. Useful when the validator runs against a site with a different
+  directory layout, or when narrowing a debugging audit to a single
+  subdirectory.
 
-`--strict` now escalates orphan-image INFO findings to failures, in
-addition to its existing v7.2.1 behaviour for title/description length.
-
-## Fallback behaviour
-
-If the nginx config is unreadable (e.g. running the validator on a dev
-machine without prod config), sections 20 and 21 fall back to a small
-inline `KNOWN_REDIRECTS` constant containing the five image redirects that
-motivated this release. A YELLOW warning indicates the fallback is in use.
-The orphan audit handles the same case via the redirect set it discovers
-(or falls back to KNOWN_REDIRECTS).
-
-The nginx config remains the single source of truth. The inline fallback
-exists so the validator runs without prod access; it should not be
-relied on for production audits.
+All other v7.3 flags continue to work unchanged.
 
 ## Other changes
 
-- `collect_page_data()` now parses `<source srcset="...">` inside `<picture>`
-  elements and `<img srcset="...">` attributes, in addition to `<img src>`.
-  v7.2.1 missed these, which would have produced false-positive orphan
-  findings for any responsive image. Same-domain image references are now
-  collected as normalised paths in `data['image_sources']`.
-- Version string consolidated into a single `__version__` module constant.
-  Previously hardcoded in three places (docstring, argparse version action,
-  main() banner). Shipped as a separate prep commit.
-- `Path` and `os` added to imports for the filesystem walk in section 22.
+- `_verify_redirect` accepts any 2xx final status as healthy. The
+  previous `final_status != 200` check was unnecessarily narrow; a 201
+  or 204 would have been flagged as a broken target despite being valid
+  HTTP success responses. In practice every speytech.com redirect target
+  resolves to 200, but the tighter check could surface false-positives
+  on sites that use other 2xx codes for asset responses.
+- `head_check()` helper added for the section 5 og:image verification.
+  Wraps `requests.head()` with `allow_redirects=True` so a 301'd og:image
+  still resolves to 200. Returns `(status, error)` tuple; error is None
+  on success.
 
 ## Performance impact
 
-Section 20 verifies the 5 image redirects in ~1 second.
-Section 21 verifies the full 17-rule set in ~3 seconds.
-Section 22 is a pure filesystem walk and runs in well under a second.
+| Section | v7.3.0 runtime | v7.4.0 runtime | Delta |
+|---------|----------------|----------------|-------|
+| Section 5 (Open Graph) | <0.1s | +1-2s (67 HEADs ÷ 10 workers) | +1-2s |
+| Section 21 (Redirect Set) | ~3s | +<0.01s (Counter pass) | +0.01s |
+| Section 22 (Orphan) | <0.1s | +<0.1s (one extra rglob) | +0.1s |
+| **Total v7.4 delta** | | | **~2-3s** |
 
-Total v7.3 additions: roughly 4–5 seconds on top of the existing v7.2.1
-runtime of ~30 seconds against speytech.com's 85 sitemap URLs. Well within
-the 5-second additional-runtime budget set out in the v7.3 ticket.
+Total runtime against speytech.com's 85-URL sitemap remains under 40s
+in sampled mode, well within typical CI budgets.
 
 ## Backward compatibility
 
-Every existing v7.2.1 flag continues to work. Sections 2–19 are unchanged.
-New sections append at 20, 21, 22 to avoid disturbing existing CI output
-diffs. The default behaviour is to run all new sections; use the
-`--skip-*` flags to opt out individually.
+Every v7.3 CLI flag continues to work. No breaking changes. Section
+numbering unchanged (5, 21, 22 extended in place rather than new
+sections added). Existing CI integrations need no modifications.
 
-## Test discipline
+The og:image resolution check is a new hard-failure condition. If any
+article on a site currently declares a broken og:image, the v7.4 build
+will fail. This is by design: the audit is meant to catch exactly this
+class of bug. Verify the site is clean against v7.4 before integrating
+into a strict CI gate.
 
-Before declaring v7.3 done, verify the new sections fire correctly on:
+## Verification matrix
 
-1. **All-clean state** — every redirect resolves, no orphan images.
-2. **Deliberately broken redirect** — rename a redirect target file in
-   `dist/images/` and confirm section 20 reports a hard failure.
-3. **Deliberately added orphan image** — drop a test SVG in
-   `dist/images/` that no article references and confirm section 22
-   reports an INFO finding (default) or a failure (`--strict`).
+| Scenario | Mode | State | Expected exit |
+|----------|------|-------|---------------|
+| 1 | default | clean (no broken og, no duplicates, no orphans) | 0 |
+| 2 | default | one og:image returns 404 | 1 |
+| 3 | default | nginx config has a duplicate source | 1 |
+| 4 | default | orphan in `dist/og/` (deleted article's PNG retained) | 0 (INFO) |
+| 5 | --strict | orphan in `dist/og/` | 1 (escalated) |
+| 6 | default | `--image-dirs images` skips dist/og/ | 0 (orphans in og/ not flagged) |
 
-A verification recipe is provided in the v7.3 ticket and the README.
+A `VERIFICATION-v7.4.0.md` recipe accompanies this changelog with the
+exact commands to run each scenario on Axioma.
+
+## Six pre-existing orphans from v7.3 — status
+
+The six orphan images surfaced by v7.3's first production run on
+2026-05-13 (the ML observability article cluster's missing frontmatter
+image references) were resolved the same day. The v7.4.0 release runs
+against a clean baseline.
